@@ -52,6 +52,10 @@ const navItems = [
 ];
 
 function App() {
+  // Debug logging
+  console.log('App component rendering...');
+  console.log('Location:', window.location.href);
+  
   return (
     <HashRouter>
       <div className="site-layout">
