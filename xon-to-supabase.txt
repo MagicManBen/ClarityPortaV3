@@ -1,0 +1,743 @@
+// xon-to-supabase.js (ULTRA-VERBOSE)
+import 'dotenv/config';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import axios from 'axios';
+import OpenAI from 'openai';
+import { createClient } from '@supabase/supabase-js';
+
+/* =========================
+   Logging (levels: 0=silent,1=info,2=verbose,3=debug)
+========================= */
+const VERBOSE_LEVEL = Number(process.env.VERBOSE_LEVEL ?? 3); // default: DEBUG for “see everything”
+const mask = (s) => (s ? `${String(s).slice(0,4)}…${String(s).slice(-4)} (len=${String(s).length})` : '(empty)');
+const t0Boot = Date.now();
+const hr = () => '─'.repeat(78);
+function log(level, ...args) {
+  if (level <= VERBOSE_LEVEL) console.log(...args);
+}
+const INFO=1, VERB=2, DEBUG=3;
+
+/* =========================
+   Config / ENV
+========================= */
+const {
+  XON_API_BASE = 'https://platform.x-onweb.com',
+  XON_API_KEY,
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE,
+  POLL_SECONDS = '30',
+  MIN_INTERVAL_MS = '700',
+  OPENAI_API_KEY,
+  TRANSCRIBE_MODEL = 'gpt-4o-mini-transcribe',
+  ANALYZE_MODEL = 'gpt-4o-mini',
+} = process.env;
+
+if (!XON_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error('✖ Missing env: XON_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE');
+  process.exit(1);
+}
+if (!OPENAI_API_KEY) {
+  console.warn('⚠ OPENAI_API_KEY not set. Transcription/analysis will be skipped.');
+}
+
+log(INFO, hr());
+log(INFO, 'BOOT  ', new Date().toISOString());
+log(INFO, 'CONFIG',
+  `XON_API_BASE=${XON_API_BASE}`,
+  `XON_API_KEY=${mask(XON_API_KEY)}`,
+  `SUPABASE_URL=${SUPABASE_URL}`,
+  `SUPABASE_SERVICE_ROLE=${mask(SUPABASE_SERVICE_ROLE)}`,
+  `OPENAI_API_KEY=${mask(OPENAI_API_KEY)}`,
+  `TRANSCRIBE_MODEL=${TRANSCRIBE_MODEL}`,
+  `ANALYZE_MODEL=${ANALYZE_MODEL}`,
+  `POLL_SECONDS=${POLL_SECONDS}`,
+  `MIN_INTERVAL_MS=${MIN_INTERVAL_MS}`,
+  `VERBOSE_LEVEL=${VERBOSE_LEVEL}`
+);
+log(INFO, hr());
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+const http = axios.create({
+  baseURL: `${XON_API_BASE}/api/v1`,
+  headers: { Authorization: `Bearer ${XON_API_KEY}`, 'Content-Type': 'application/json' },
+  timeout: 20000,
+});
+
+/* =========================
+   Business hours (08:00–18:30 local)
+========================= */
+function localISOAt(h, m) {
+  const d = new Date();
+  d.setHours(h, m, 0, 0);
+  return d.toISOString();
+}
+function nowWithinBusinessHours() {
+  const now = new Date();
+  const start = new Date(); start.setHours(8, 0, 0, 0);
+  const end   = new Date(); end.setHours(18,30,0, 0);
+  return now >= start && now <= end;
+}
+const TODAY_START_ISO = localISOAt(8, 0);
+const TODAY_END_DATE = (() => { const d = new Date(); d.setHours(18,30,0,0); return d; })();
+
+log(INFO, `WINDOW  08:00 → 18:30 local   |  TodayStart=${TODAY_START_ISO}  TodayEnd=${TODAY_END_DATE.toISOString()}`);
+log(INFO, hr());
+
+/* =========================
+   Throttle + Retry wrappers
+========================= */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+let lastReq = 0;
+const MIN_GAP = Number(MIN_INTERVAL_MS) || 700;
+
+async function throttled(name, fn) {
+  const now = Date.now();
+  const wait = Math.max(0, lastReq + MIN_GAP - now);
+  if (wait) { log(DEBUG, `⏳ throttle ${name}: waiting ${wait}ms`); await sleep(wait); }
+  lastReq = Date.now();
+  const t = Date.now();
+  try {
+    const out = await fn();
+    log(DEBUG, `✓ ${name} in ${Date.now()-t}ms`);
+    return out;
+  } catch (e) {
+    log(DEBUG, `✖ ${name} failed in ${Date.now()-t}ms`);
+    throw e;
+  }
+}
+
+async function apiGet(pathOrUrl, params) {
+  return throttled(`GET ${pathOrUrl}`, async () => {
+    try {
+      log(VERB, `HTTP → GET ${pathOrUrl}`, params ? JSON.stringify(params) : '');
+      const res = await http.get(pathOrUrl, { params });
+      log(VERB, `HTTP ← ${res.status} ${pathOrUrl}`);
+      return res;
+    } catch (e) {
+      const res = e.response;
+      if (res?.status === 429) {
+        const retrySec = Number(res.headers?.['retry-after'] || '5');
+        const ms = Math.max(1000, retrySec * 1000);
+        console.log(`[rate] 429 Too Many Requests → waiting ${ms}ms then retrying ${pathOrUrl}`);
+        await sleep(ms);
+        return apiGet(pathOrUrl, params); // retry
+      }
+      log(INFO, `HTTP ✖ ${pathOrUrl} ${res?.status || ''} ${e.message}`);
+      throw e;
+    }
+  });
+}
+
+async function apiGetArrayBuffer(pathOrUrl) {
+  return throttled(`GET_BIN ${pathOrUrl}`, async () => {
+    try {
+      log(VERB, `HTTP(bin) → GET ${pathOrUrl}`);
+      const res = await http.get(pathOrUrl, { responseType: 'arraybuffer' });
+      log(VERB, `HTTP(bin) ← ${res.status} ${pathOrUrl} size=${res.data?.byteLength ?? 0}`);
+      return res;
+    } catch (e) {
+      const res = e.response;
+      if (res?.status === 429) {
+        const retrySec = Number(res.headers?.['retry-after'] || '5');
+        const ms = Math.max(1000, retrySec * 1000);
+        console.log(`[rate] 429 Too Many Requests → waiting ${ms}ms then retrying ${pathOrUrl}`);
+        await sleep(ms);
+        return apiGetArrayBuffer(pathOrUrl); // retry
+      }
+      log(INFO, `HTTP(bin) ✖ ${pathOrUrl} ${res?.status || ''} ${e.message}`);
+      throw e;
+    }
+  });
+}
+
+async function withRetries(name, fn, max = 2, baseDelayMs = 1200) {
+  let attempt = 0;
+  while (true) {
+    try {
+      log(DEBUG, `↻ ${name} attempt ${attempt+1}/${max+1}`);
+      const t = Date.now();
+      const out = await fn();
+      log(DEBUG, `✓ ${name} ok in ${Date.now()-t}ms`);
+      return out;
+    } catch (err) {
+      attempt++;
+      if (attempt > max) {
+        log(INFO, `✖ ${name} failed after ${attempt} attempts: ${err?.message || err}`);
+        throw err;
+      }
+      const wait = baseDelayMs * attempt;
+      console.warn(`[retry] ${name} failed (attempt ${attempt}/${max + 1}): ${err?.message || err}. Retrying in ${wait}ms`);
+      await sleep(wait);
+    }
+  }
+}
+
+/* =========================
+   Pagination
+========================= */
+async function* pagedGet(path, params) {
+  let url = path;
+  let query = { ...params };
+  let pageNo = 0;
+  while (true) {
+    pageNo++;
+    const { data } = await apiGet(url, query);
+    const count = data?.data?.length ?? 0;
+    log(INFO, `• Page ${pageNo}: ${count} call(s)`);
+    yield data;
+    const next = data?.meta?.pagination?.links?.next;
+    if (!next) break;
+    url = next.replace(`${process.env.XON_API_BASE || 'https://platform.x-onweb.com'}`, '').replace('/api/v1', '');
+    query = undefined;
+  }
+}
+
+/* =========================
+   Map to DB row
+========================= */
+function mapCallRow(call, extras) {
+  const durations = call?.durations || {};
+  return {
+    id: call.id?.toString(),
+    direction: call.direction,
+    call_type: call.type,
+    is_internal: call.is_internal ?? call.internal ?? null,
+    media_type: call.media_type || 'audio',
+
+    started_at: call.start_time ? new Date(call.start_time).toISOString() : null,
+    ended_at: call.end_time ? new Date(call.end_time).toISOString() : null,
+
+    outcome: call.outcome,
+    reason: call.reason,
+    status: 'completed',
+
+    duration_total_sec: (call.end_time && call.start_time)
+      ? Math.max(0, ((new Date(call.end_time) - new Date(call.start_time)) / 1000) | 0)
+      : null,
+    ring_sec: durations.ring ?? null,
+    talk_sec: durations.talk ?? null,
+    ivr_sec: durations.ivr ?? null,
+    hold_sec: durations.hold ?? null,
+    queue_sec: durations.queue ?? null,
+
+    caller_number: call.caller?.number ?? null,
+    caller_name: call.caller?.name ?? null,
+    caller_account_id: call.caller?.account ?? null,
+    caller_withheld: call.caller?.withheld ?? null,
+
+    dialled_number: call.dialled?.number ?? null,
+    dialled_name: call.dialled?.name ?? null,
+
+    agent_user_id: call.agent?.account ?? null,
+    agent_user_name: call.agent?.name ?? null,
+    agent_extension: call.agent?.number ?? null,
+
+    last_queue_group_id: call.group?.account ?? null,
+    last_queue_group_name: call.group?.name ?? null,
+
+    has_recording: (extras.audio_list || []).some(a => (a.type || '').toUpperCase().includes('RECORDING')),
+    has_voicemail: (extras.audio_list || []).some(a => (a.type || '').toUpperCase().includes('VOICEMAIL')),
+
+    last_dtmf_choice: extras.menu_steps?.at(-1)?.choice ?? null,
+    last_dtmf_choice_name: extras.menu_steps?.at(-1)?.choice_name ?? null,
+
+    wrap_up_latest_code: extras.wrap_up_list?.at(-1)?.code ?? null,
+    wrap_up_latest_time: extras.wrap_up_list?.at(-1)?.end_time
+      ? new Date(extras.wrap_up_list.at(-1).end_time).toISOString()
+      : null,
+
+    link_self: call.links?.find(l => l.rel === 'self')?.uri ?? null,
+    link_audio: call.links?.find(l => l.rel === 'call.audio')?.uri ?? null,
+    link_actions: call.links?.find(l => l.rel === 'call.actions')?.uri ?? null,
+    link_queues: call.links?.find(l => l.rel === 'call.queues')?.uri ?? null,
+    link_menus: call.links?.find(l => l.rel === 'call.menus')?.uri ?? null,
+
+    audio_list: extras.audio_list ?? [],
+    action_list: extras.action_list ?? [],
+    queue_visits: extras.queue_visits ?? [],
+    menu_steps: extras.menu_steps ?? [],
+    wrap_up_list: extras.wrap_up_list ?? [],
+
+    raw_call: call,
+    raw_audio_payload: extras.raw_audio_payload ?? null,
+    raw_actions_payload: extras.raw_actions_payload ?? null,
+    raw_queues_payload: extras.raw_queues_payload ?? null,
+    raw_menus_payload: extras.raw_menus_payload ?? null,
+    raw_wrapups_payload: extras.raw_wrapups_payload ?? null,
+
+    ingested_from: 'xon_platform_v1',
+    updated_at: new Date().toISOString(),
+  };
+}
+
+/* =========================
+   Fetch related resources (timed)
+========================= */
+async function fetchExtras(callId) {
+  const t = Date.now();
+  const extras = {};
+
+  const q = await apiGet(`/calls/${callId}/queues`).catch(() => ({ data: null }));
+  extras.raw_queues_payload = q?.data ?? null;
+  extras.queue_visits = q?.data?.data?.map(x => ({
+    id: x.id, start_time: x.start_time, end_time: x.end_time, outcome: x.outcome,
+    account: x.account, account_name: x.account_name,
+    distribution_account: x.distribution_account, distribution_name: x.distribution_name,
+    links: x.links
+  })) ?? [];
+  log(VERB, `  queues: ${extras.queue_visits.length}`);
+
+  await sleep(100);
+
+  const m = await apiGet(`/calls/${callId}/menus`).catch(() => ({ data: null }));
+  extras.raw_menus_payload = m?.data ?? null;
+  extras.menu_steps = m?.data?.data?.map(x => ({
+    id: x.id, start_time: x.start_time, end_time: x.end_time,
+    name: x.name, choice: x.choice, choice_name: x.choice_name, links: x.links
+  })) ?? [];
+  log(VERB, `  menus: ${extras.menu_steps.length}`);
+
+  await sleep(100);
+
+  const w = await apiGet(`/calls/${callId}/wrapupcodes`).catch(() => ({ data: null }));
+  extras.raw_wrapups_payload = w?.data ?? null;
+  extras.wrap_up_list = w?.data?.data?.map(x => ({
+    id: x.id, end_time: x.end_time, code: x.code, links: x.links
+  })) ?? [];
+  log(VERB, `  wrapups: ${extras.wrap_up_list.length}`);
+
+  await sleep(100);
+
+  const a = await apiGet(`/calls/${callId}/actions`).catch(() => ({ data: null }));
+  extras.raw_actions_payload = a?.data ?? null;
+  extras.action_list = a?.data?.data?.map(x => ({
+    id: x.id, time: x.time, type: x.type, data: x.data,
+    account: x.account, account_name: x.account_name, links: x.links
+  })) ?? [];
+  log(VERB, `  actions: ${extras.action_list.length}`);
+
+  await sleep(100);
+
+  const au = await apiGet(`/calls/${callId}/audio`).catch(() => ({ data: null }));
+  extras.raw_audio_payload = au?.data ?? null;
+  extras.audio_list = au?.data?.data?.map(x => ({
+    id: x.id, type: x.type, user: x.user, file_size: x.file_size,
+    duration: x.duration, read_time: x.read_time, links: x.links
+  })) ?? [];
+  log(VERB, `  audio: ${extras.audio_list.length}`);
+
+  log(VERB, `  fetchExtras(${callId}) in ${Date.now() - t}ms`);
+  return extras;
+}
+
+/* =========================
+   AI policies you requested
+========================= */
+const CATEGORY_OPTIONS_NO_GE = [
+  'Prescription request',
+  'Appointment request',
+  'Test results',
+  'Admin/Forms/Letters',
+  'Sick note (Fit Note)',
+  'Medication review',
+  'Referral/Letter',
+  'Complaints/Feedback',
+  'Emergency/Urgent',
+  'No interaction / Hung up'
+];
+
+function getFirstRecordingUrl(row) {
+  const firstRec = (row.audio_list || []).find(a =>
+    String(a.type || '').toUpperCase().includes('RECORDING')
+  );
+  return firstRec?.links?.find(l => l.rel === 'self')?.uri ?? null;
+}
+
+async function downloadAudioBuffer(recordingUrl) {
+  const { data } = await apiGetArrayBuffer(recordingUrl);
+  return Buffer.from(data);
+}
+
+async function transcribeAudio(buffer, filename = 'audio.mp3') {
+  if (!openai) return { text: null, json: null, confidence: null };
+
+  const tmp = path.join(os.tmpdir(), `xon-${Date.now()}-${filename}`);
+  await fs.promises.writeFile(tmp, buffer);
+
+  try {
+    const make = async () =>
+      openai.audio.transcriptions.create({
+        file: fs.createReadStream(tmp),
+        model: TRANSCRIBE_MODEL,
+        language: 'en',
+        temperature: 0,
+        prompt:
+          'Clinic: Harley Street Medical Centre (Hanley). Common words: Accurx, triage, prescription, appointment, safeguarding. ' +
+          'Two speakers: Staff (practice) and Caller (patient). Output a clean transcript with each line prefixed "Staff:" or "Caller:".'
+      });
+    const t = Date.now();
+    const resp = await withRetries('openai.transcribe', make, 2, 1500);
+    log(VERB, `  openai.transcribe ok in ${Date.now()-t}ms, textChars=${(resp.text||'').length}`);
+    const text = resp.text || resp.transcript || '';
+    const json = resp.segments ? { segments: resp.segments } : null;
+    const conf = typeof resp.confidence === 'number' ? resp.confidence : null;
+    return { text, json, confidence: conf };
+  } finally {
+    fs.promises.unlink(tmp).catch(() => {});
+  }
+}
+
+function buildMetaHint(callRow) {
+  const lastMenu = callRow.menu_steps?.at(-1)?.choice_name || callRow.last_dtmf_choice_name || null;
+  const t = callRow.talk_sec ?? null;
+  const q = callRow.queue_sec ?? null;
+  const shortCall = (t || 0) < 12;
+  const callStart = callRow.started_at || null;
+  return `Meta: last_menu="${lastMenu}", talk_sec=${t}, queue_sec=${q}, short_call=${shortCall}, CALL_START=${callStart}, TZ=Europe/London`;
+}
+
+function normalizeDateOnly(s) {
+  if (!s) return null;
+  const m = String(s).match(/\b\d{4}-\d{2}-\d{2}\b/);
+  return m ? m[0] : null;
+}
+
+async function analyzeTranscript(callRow, transcriptText) {
+  if (!openai || !transcriptText) {
+    return {
+      summary_one_line: null,
+      reason_for_call: null,
+      outcome_summary: null,
+      category: 'Admin/Forms/Letters',
+      appointment_offered: false,
+      appointment_booked: false,
+      asked_to_call_back_8am: false,
+      asked_to_call_back_8am_quote: null,
+      clinical_issue_term: 'Other/Unclear',
+      appointment_booked_for_date: null
+    };
+  }
+
+  const sys = `You assist a UK GP surgery call centre.
+Return STRICT JSON ONLY with:
+- reason_for_call: short phrase (<= 12 words)
+- outcome_summary: short phrase (<= 12 words)
+- summary_one_line: <= 25 words (legacy)
+- category: one of ${JSON.stringify(CATEGORY_OPTIONS_NO_GE)}
+- appointment_offered: true/false
+- appointment_booked: true/false
+- appointment_booked_for_date: YYYY-MM-DD if clearly stated or inferable relative to CALL_START (Europe/London), else null
+- asked_to_call_back_8am: true/false  # set TRUE if told to "call back" at 8am OR any explicit later time/day (e.g., tomorrow, Monday)
+- asked_to_call_back_8am_quote: exact wording that indicates a call-back instruction, else ""
+- clinical_issue_term: NHS A–Z condition label (e.g., "Constipation", "UTI", "Sore throat"). If unclear, "Other/Unclear".
+Rules:
+- NEVER use "General enquiry".
+- Short IVR/silence or <10s with no content => category "No interaction / Hung up".
+- Be conservative with booleans—only true if clearly stated.`;
+
+  const meta = buildMetaHint(callRow);
+  const user = `Transcript (Staff=practice, Caller=patient):
+${transcriptText}
+
+${meta}
+
+Return JSON only.`;
+
+  const make = async () =>
+    openai.chat.completions.create({
+      model: ANALYZE_MODEL,
+      temperature: 0,
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: user }
+      ],
+      response_format: { type: 'json_object' }
+    });
+
+  const t = Date.now();
+  const chat = await withRetries('openai.analyze', make, 2, 1500);
+  const content = chat.choices?.[0]?.message?.content || '{}';
+  log(VERB, `  openai.analyze ok in ${Date.now()-t}ms`);
+  log(DEBUG, `  analyze JSON preview: ${(content||'').slice(0,300)}${(content||'').length>300?'…':''}`);
+
+  let parsed;
+  try { parsed = JSON.parse(content); } catch { parsed = {}; }
+
+  if (!CATEGORY_OPTIONS_NO_GE.includes(parsed.category)) parsed.category = 'Admin/Forms/Letters';
+
+  parsed.summary_one_line ||= null;
+  parsed.reason_for_call = parsed.reason_for_call?.toString?.() || null;
+  parsed.outcome_summary = parsed.outcome_summary?.toString?.() || null;
+  parsed.appointment_offered = !!parsed.appointment_offered;
+  parsed.appointment_booked = !!parsed.appointment_booked;
+  parsed.asked_to_call_back_8am = !!parsed.asked_to_call_back_8am;
+  parsed.asked_to_call_back_8am_quote = (parsed.asked_to_call_back_8am_quote?.toString?.() || '').trim() || null;
+  parsed.clinical_issue_term = parsed.clinical_issue_term?.toString?.() || 'Other/Unclear';
+  parsed.appointment_booked_for_date = normalizeDateOnly(parsed.appointment_booked_for_date);
+
+  return parsed;
+}
+
+/* =========================
+   DB helpers
+========================= */
+async function upsertRow(row) {
+  const t = Date.now();
+  const { data, error } = await supabase.from('call_logs_allfields').upsert(row, { onConflict: 'id' }).select('id');
+  if (error) {
+    log(INFO, `  DB ✖ upsert ${row.id}: ${error.message}`);
+    throw error;
+  }
+  log(VERB, `  DB ✓ upsert ${row.id} in ${Date.now()-t}ms`);
+  return data;
+}
+async function getExistingIds(ids) {
+  if (!ids?.length) return new Set();
+  const t = Date.now();
+  const { data, error } = await supabase.from('call_logs_allfields')
+    .select('id')
+    .in('id', ids.map(String));
+  if (error) { log(INFO, `  DB ✖ select existing: ${error.message}`); throw error; }
+  const set = new Set((data || []).map(r => String(r.id)));
+  log(VERB, `  DB ✓ existing check ${set.size}/${ids.length} in ${Date.now()-t}ms`);
+  return set;
+}
+
+/* =========================
+   AI eligibility filter
+========================= */
+function shouldSendToAI(row) {
+  const typeOK = ['GROUP', 'CALLBACK'].includes(String(row.call_type || '').toUpperCase());
+  const notNoAnswer = String(row.outcome || '').toUpperCase() !== 'NO_ANSWER';
+  const hasRec = !!row.has_recording;
+  if (!typeOK) return { ok: false, reason: 'type_not_eligible' };
+  if (!notNoAnswer) return { ok: false, reason: 'no_answer' };
+  if (!hasRec) return { ok: false, reason: 'no_recording' };
+  return { ok: true };
+}
+
+/* =========================
+   Write AI to DB (with your rules)
+========================= */
+async function updateRowWithAI(callId, ai, transcriptMeta = {}) {
+  const clinical_issue_final =
+    (ai.category === 'Appointment request') ? (ai.clinical_issue_term ?? 'Other/Unclear') : null;
+
+  const patch = {
+    id: callId,
+    transcript_text: ai.transcript_text ?? null,
+    transcript_json: ai.transcript_json ?? null,
+    transcript_model: TRANSCRIBE_MODEL,
+    transcript_confidence: ai.transcript_confidence ?? null,
+
+    reason_for_call: ai.reason_for_call ?? null,
+    outcome_summary: ai.outcome_summary ?? null,
+    summary_one_line: ai.summary_one_line ?? null,
+
+    category: ai.category ?? 'Admin/Forms/Letters',
+    appointment_offered: !!ai.appointment_offered,
+    appointment_booked: !!ai.appointment_booked,
+    appointment_booked_for_date: ai.appointment_booked_for_date ?? null,
+    asked_to_call_back_8am: !!ai.asked_to_call_back_8am,
+    asked_to_call_back_8am_quote: ai.asked_to_call_back_8am_quote ?? null,
+
+    clinical_issue: clinical_issue_final,
+
+    ai_last_error: null,
+    updated_at: new Date().toISOString(),
+    ...transcriptMeta
+  };
+
+  await upsertRow(patch);
+}
+
+/* =========================
+   Process a single call (full trace)
+========================= */
+async function processOneCall(call) {
+  log(INFO, `• Processing ${call.id} ${call.direction}/${call.type} end=${call.end_time || 'live'}`);
+
+  const extras = await fetchExtras(call.id).catch(e => { console.warn('[extras] error', e.message); return {}; });
+  const row = mapCallRow(call, extras);
+  await upsertRow(row);
+
+  const elig = shouldSendToAI(row);
+  if (!elig.ok) {
+    log(INFO, `  └─ AI skip: ${elig.reason}`);
+    return { status: 'upserted_only', reason: elig.reason };
+  }
+  if (!OPENAI_API_KEY) {
+    log(INFO, '  └─ AI skip: OPENAI_API_KEY not set');
+    return { status: 'upserted_only', reason: 'no_openai_key' };
+  }
+
+  const recUrl = getFirstRecordingUrl(row);
+  if (!recUrl) {
+    log(INFO, '  └─ AI skip: no recording URL');
+    return { status: 'upserted_only', reason: 'no_rec_url' };
+  }
+
+  try {
+    const tDL = Date.now();
+    const buf = await downloadAudioBuffer(recUrl);
+    log(VERB, `  audio buffer: ${buf.length} bytes in ${Date.now()-tDL}ms`);
+
+    const tTX = Date.now();
+    const t = await transcribeAudio(buf, `${row.id}.mp3`);
+    log(VERB, `  transcript chars=${(t.text||'').length} (took ${Date.now()-tTX}ms)`);
+
+    const tAN = Date.now();
+    const analysis = await analyzeTranscript(row, t.text);
+    log(VERB, `  analyze → category=${analysis.category} booked=${analysis.appointment_booked} cb8=${analysis.asked_to_call_back_8am}`);
+
+    const tDB = Date.now();
+    await updateRowWithAI(row.id, {
+      transcript_text: t.text,
+      transcript_json: t.json,
+      transcript_confidence: t.confidence,
+      reason_for_call: analysis.reason_for_call,
+      outcome_summary: analysis.outcome_summary,
+      summary_one_line: analysis.summary_one_line,
+      category: analysis.category,
+      appointment_offered: analysis.appointment_offered,
+      appointment_booked: analysis.appointment_booked,
+      asked_to_call_back_8am: analysis.asked_to_call_back_8am,
+      asked_to_call_back_8am_quote: analysis.asked_to_call_back_8am_quote,
+      clinical_issue_term: analysis.clinical_issue_term,
+      appointment_booked_for_date: analysis.appointment_booked_for_date
+    });
+    log(VERB, `  DB writeback in ${Date.now()-tDB}ms`);
+
+    log(INFO, '  └─ AI ok ✓');
+    return { status: 'ai_ok' };
+  } catch (e) {
+    console.warn('  └─ AI pipeline error:', e?.message || e);
+    await upsertRow({
+      id: row.id,
+      ai_last_error: String(e?.message || e),
+      updated_at: new Date().toISOString(),
+    });
+    return { status: 'ai_error', error: e?.message || String(e) };
+  }
+}
+
+/* =========================
+   Fetch helpers
+========================= */
+async function fetchCallsSince(startISO) {
+  const picked = [];
+  let pages = 0, total = 0;
+  const t = Date.now();
+  for await (const page of pagedGet('/calls', { start_date: startISO })) {
+    pages++;
+    const calls = page?.data || [];
+    total += calls.length;
+    picked.push(...calls);
+  }
+  log(INFO, `[fetch] since=${startISO} → total=${total} pages=${pages} in ${Date.now()-t}ms`);
+  return { calls: picked, pages, total };
+}
+
+async function fetchLatestApproxN(startISO, n = 10) {
+  const t = Date.now();
+  const first = await apiGet('/calls', { start_date: startISO }).then(r => r.data).catch(() => null);
+  if (!first) return [];
+  const arr = (first.data || []).slice();
+  arr.sort((a, b) => {
+    const ea = new Date(a.end_time || a.start_time || 0).getTime();
+    const eb = new Date(b.end_time || b.start_time || 0).getTime();
+    return eb - ea;
+  });
+  const out = arr.slice(0, n);
+  log(VERB, `[fetchLatest] got=${arr.length} sliced=${out.length} in ${Date.now()-t}ms`);
+  return out;
+}
+
+/* =========================
+   Initial catch-up + Poll until 18:30
+========================= */
+async function initialCatchUp() {
+  log(INFO, `[start] Window: ${TODAY_START_ISO} → ${TODAY_END_DATE.toISOString()} (local 08:00–18:30)`);
+  if (!nowWithinBusinessHours()) {
+    log(INFO, '[exit] Outside business hours. Nothing to do.');
+    process.exit(0);
+  }
+
+  log(INFO, `[init] Fetching all calls since ${TODAY_START_ISO} ...`);
+  const { calls, pages, total } = await fetchCallsSince(TODAY_START_ISO);
+  log(INFO, `[init] Got ${total} call(s) across ${pages} page(s). Checking Supabase for existing IDs...`);
+
+  const ids = calls.map(c => String(c.id));
+  const existing = await getExistingIds(ids);
+  const toProcess = calls.filter(c => !existing.has(String(c.id)));
+
+  log(INFO, `[init] Existing rows: ${existing.size}. New to process: ${toProcess.length}.`);
+
+  let upserts = 0, aiOk = 0, aiErr = 0, skippedAI = 0;
+  for (const call of toProcess) {
+    const res = await processOneCall(call);
+    if (res.status === 'ai_ok') { aiOk++; upserts++; }
+    else if (res.status === 'ai_error') { aiErr++; upserts++; }
+    else if (res.status === 'upserted_only') { skippedAI++; upserts++; }
+  }
+  log(INFO, `[init] Summary: upserts=${upserts} ai_ok=${aiOk} ai_err=${aiErr} ai_skipped=${skippedAI}`);
+}
+
+async function pollLoop() {
+  const pollMs = Number(POLL_SECONDS) * 1000;
+  log(INFO, `[poll] Every ${POLL_SECONDS}s (latest ~10) until 18:30 local...`);
+  const timer = setInterval(async () => {
+    const now = new Date();
+    if (now > TODAY_END_DATE) {
+      log(INFO, '[exit] Reached 18:30 — stopping poll.');
+      clearInterval(timer);
+      process.exit(0);
+    }
+
+    try {
+      const latest = await fetchLatestApproxN(TODAY_START_ISO, 10);
+      const ids = latest.map(c => String(c.id));
+      const existing = await getExistingIds(ids);
+      const newOnes = latest.filter(c => !existing.has(String(c.id)));
+      if (!newOnes.length) {
+        log(INFO, `[poll] ${now.toISOString()} — no new calls among latest 10.`);
+      } else {
+        log(INFO, `[poll] ${now.toISOString()} — found ${newOnes.length} new call(s) among latest 10.`);
+        for (const call of newOnes) {
+          if (!call.end_time) { log(INFO, `  └─ Skip ${call.id}: no end_time (likely in-progress).`); continue; }
+          await processOneCall(call);
+        }
+      }
+    } catch (e) {
+      console.warn('[poll] error:', e?.message || e);
+    }
+  }, pollMs);
+
+  // Heartbeat every 2 minutes
+  setInterval(() => {
+    const mu = process.memoryUsage();
+    log(INFO, `[hb] ${new Date().toISOString()} RSS=${(mu.rss/1e6).toFixed(1)}MB HeapUsed=${(mu.heapUsed/1e6).toFixed(1)}MB`);
+  }, 120000);
+}
+
+/* =========================
+   Run
+========================= */
+process.on('uncaughtException', (e) => {
+  console.error('UNCAUGHT EXCEPTION:', e?.message || e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('UNHANDLED REJECTION:', e?.message || e);
+});
+
+async function main() {
+  log(INFO, `[boot] ${new Date().toISOString()} — Start (PID ${process.pid})`);
+  await initialCatchUp();
+  await pollLoop();
+  log(INFO, `[boot] Ready in ${(Date.now()-t0Boot)/1000}s`);
+}
+main().catch(err => { console.error(err); process.exit(1); });
